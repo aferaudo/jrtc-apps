@@ -123,12 +123,13 @@ uint64_t jbpf_main(void *state)
     }
     next_hdr = (__u8 *)next_hdr + sizeof(struct data_section_hdr);
 
-    /* --- Parse Compression Header --- */
-    struct compression_hdr *comp_hdr = (struct compression_hdr *)next_hdr;
-    if ((void *)(comp_hdr + 1) >= pkt_end) {
-        return JBPF_CODELET_FAILURE;
-    }
-    next_hdr = (__u8 *)next_hdr + sizeof(struct compression_hdr);
+    /* --- Static compression: udCompHdr is absent from the packet ---
+     * srsRAN uses static compression configured via M-Plane, so the
+     * compression header is NOT present in the U-Plane packet.
+     * Compression parameters are known from deployment config:
+     *   BFP 9-bit (comp_method=1, iq_width=9)
+     * Do NOT advance next_hdr here — IQ data starts immediately
+     * after the data section header. */
 
     /* --- Sampling logic --- */
     uint32_t *period = (uint32_t *)jbpf_map_lookup_elem(&sampling_config, &zero_index);
@@ -162,30 +163,37 @@ uint64_t jbpf_main(void *state)
         return JBPF_CODELET_FAILURE;
     }
 
-    /* --- Fill metadata --- */
-    out->timestamp = jbpf_time_get_ns();
     out->direction = ctx->direction;
-    out->frame_id = app_hdr->frame_id;
-    out->subframe_id = (uint16_t)(app_hdr->sf_slot_sym.subframe_id);
-    out->slot_id = (uint16_t)(app_hdr->sf_slot_sym.slot_id);
-    out->symbol_id = (uint16_t)(app_hdr->sf_slot_sym.symb_id);
-    out->section_id = (uint16_t)(data_hdr->fields.sect_id);
-    out->start_prbu = (uint16_t)(data_hdr->fields.start_prbu);
+    out->frame_id = app_hdr->frame_id;  /* single byte, no endianness issue */
 
-    uint16_t num_prbu = (uint16_t)(data_hdr->fields.num_prbu);
-    /* num_prbu of 0 means max PRB (273) per O-RAN spec */
-    if (num_prbu == 0) {
+    /* sf_slot_sym is 16 bits in network byte order:
+    *   [subframeId:4][slotId:6][symbolId:6]
+    * Must byte-swap before extracting. */
+    uint16_t sf_slot_sym = jbpf_ntohs(app_hdr->sf_slot_sym.value);
+    out->subframe_id = (sf_slot_sym >> 12) & 0xF;
+    out->slot_id     = (sf_slot_sym >> 6)  & 0x3F;
+    out->symbol_id   = sf_slot_sym & 0x3F;
+
+    /* data_section_hdr is 32 bits in network byte order:
+    *   [sect_id:12][rb:1][sym_inc:1][start_prbu:10][num_prbu:8]
+    * Same issue — byte-swap first. */
+    uint32_t sec_bits = jbpf_ntohl(data_hdr->fields.all_bits);
+    out->section_id = (sec_bits >> 20) & 0xFFF;
+    out->start_prbu = (sec_bits >> 8)  & 0x3FF;
+    uint16_t num_prbu = sec_bits & 0xFF;
+    if (num_prbu == 0)
         num_prbu = 273;
-    }
     out->num_prbu = num_prbu;
 
-    out->comp_method = comp_hdr->ud_comp_meth;
-    out->iq_width = comp_hdr->ud_iq_width;
+    /* Static compression: hardcode BFP 9-bit parameters */
+    out->comp_method = 1;  /* BFP */
+    out->iq_width = 9;     /* 9-bit I/Q width */
 
     /* --- Copy I/Q payload --- */
-    /* next_hdr now points to the start of I/Q data (after compression header).
-     * For BFP compression, each PRB starts with a 1-byte compression parameter
-     * followed by the compressed I/Q samples. We copy the raw bytes as-is. */
+    /* next_hdr points to the start of BFP I/Q data (immediately after
+     * data section header — no compression header in static mode).
+     * Each PRB: 1-byte exponent + 27 bytes (12 I/Q pairs × 9 bits × 2).
+     * We copy the raw compressed bytes as-is. */
     void *iq_start = next_hdr;
     uint64_t avail = (uint64_t)pkt_end - (uint64_t)iq_start;
 

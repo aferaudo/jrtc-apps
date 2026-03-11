@@ -8,4 +8,5 @@ codelet_descriptor:
     priority: 1
     out_io_channel:
       - name: output_map
+        stream_id: "f1f2290fd2685d17ecc9902c4c9f05fe"
         forward_destination: DestinationNone
