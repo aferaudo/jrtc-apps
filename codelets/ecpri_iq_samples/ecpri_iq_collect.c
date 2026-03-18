@@ -123,13 +123,15 @@ uint64_t jbpf_main(void *state)
     }
     next_hdr = (__u8 *)next_hdr + sizeof(struct data_section_hdr);
 
-    /* --- Static compression: udCompHdr is absent from the packet ---
-     * srsRAN uses static compression configured via M-Plane, so the
-     * compression header is NOT present in the U-Plane packet.
-     * Compression parameters are known from deployment config:
-     *   BFP 9-bit (comp_method=1, iq_width=9)
-     * Do NOT advance next_hdr here — IQ data starts immediately
-     * after the data section header. */
+    /* --- Parse Dynamic Compression Header (2 bytes) ---
+     * srsRAN config has enable_ul/dl_static_compr_hdr: false,
+     * so the udCompHdr (1 byte) + reserved (1 byte) are present.
+     * udCompHdr format: bits [7:4] = iq_width, bits [3:0] = comp_method */
+    struct data_section_compression_hdr *dsc_hdr = (struct data_section_compression_hdr *)next_hdr;
+    if ((void *)(dsc_hdr + 1) >= pkt_end) {
+        return JBPF_CODELET_FAILURE;
+    }
+    next_hdr = (__u8 *)next_hdr + sizeof(struct data_section_compression_hdr);
 
     /* --- Sampling logic --- */
     uint32_t *period = (uint32_t *)jbpf_map_lookup_elem(&sampling_config, &zero_index);
@@ -185,14 +187,14 @@ uint64_t jbpf_main(void *state)
         num_prbu = 273;
     out->num_prbu = num_prbu;
 
-    /* Static compression: hardcode BFP 9-bit parameters */
-    out->comp_method = 1;  /* BFP */
-    out->iq_width = 9;     /* 9-bit I/Q width */
+    /* Read compression parameters from the parsed header */
+    out->comp_method = dsc_hdr->ud_comp_hdr.ud_comp_meth;
+    out->iq_width = dsc_hdr->ud_comp_hdr.ud_iq_width;
 
     /* --- Copy I/Q payload --- */
-    /* next_hdr points to the start of BFP I/Q data (immediately after
-     * data section header — no compression header in static mode).
-     * Each PRB: 1-byte exponent + 27 bytes (12 I/Q pairs × 9 bits × 2).
+    /* next_hdr points to the start of BFP I/Q data (after 2-byte
+     * dynamic compression header).
+     * Each PRB: 1-byte exponent + packed 9-bit I/Q samples.
      * We copy the raw compressed bytes as-is. */
     void *iq_start = next_hdr;
     uint64_t avail = (uint64_t)pkt_end - (uint64_t)iq_start;
