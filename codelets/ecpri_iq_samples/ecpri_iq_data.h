@@ -25,4 +25,10 @@ struct iq_sample_data {
     uint8_t  iq_payload[MAX_IQ_PAYLOAD_BYTES]; /* Raw compressed I/Q sample bytes */
 };
 
+/* Configuration for PRB-based filtering in the codelet.
+ * Sent via control input channel from the E3Controller. */
+struct prb_filter_config {
+    uint16_t expected_num_prbu;  /* 0 = no filtering (pass all), >0 = filter to this PRB count */
+};
+
 #endif /* ECPRI_IQ_DATA_H */
